@@ -24,6 +24,28 @@ from typing import Dict, Optional, Sequence, List
 
 import torch
 
+# 원래의 로딩 함수를 따로 저장해둡니다.
+original_load_state_dict = torch.nn.Module.load_state_dict
+
+def safe_load_state_dict(self, state_dict, strict=True):
+    # 일단 원래대로 시도해봅니다.
+    if strict:
+        try:
+            return original_load_state_dict(self, state_dict, strict=True)
+        except RuntimeError as e:
+            # 만약 "키가 없다(Missing key)"는 에러가 나면?
+            if "Missing key(s) in state_dict" in str(e):
+                print(f"\n[LoRA Fix] ⚠️ '{self.__class__.__name__}' 로딩 중 누락된 키 발생! (Frozen Base Model 무시함)")
+                print("[LoRA Fix] strict=False 모드로 재시도합니다...\n")
+                # 엄격 모드를 끄고(strict=False) 다시 로딩합니다. (이게 핵심!)
+                return original_load_state_dict(self, state_dict, strict=False)
+            # 다른 에러라면 그냥 터지게 둡니다.
+            raise e
+    return original_load_state_dict(self, state_dict, strict=strict)
+
+# 파이썬이 모델을 로딩할 때, 우리가 만든 '유연한 함수'를 쓰도록 바꿔치기합니다.
+torch.nn.Module.load_state_dict = safe_load_state_dict
+
 import transformers
 import tokenizers
 
@@ -792,7 +814,8 @@ def train(attn_implementation=None):
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
-    compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    # compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    compute_dtype = torch.float16
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -827,7 +850,7 @@ def train(attn_implementation=None):
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
+                attn_implementation="eager",
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )

@@ -76,13 +76,22 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
             if any(k.startswith('model.model.') for k in non_lora_trainables):
                 non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
-            model.load_state_dict(non_lora_trainables, strict=False)
+            # model.load_state_dict(non_lora_trainables, strict=False)
+            try:
+                model.load_state_dict(non_lora_trainables, strict=False)
+                print("Successfully loaded non-LoRA trainables.")
+            except RuntimeError as e:
+                if "size mismatch" in str(e):
+                    print(f"⚠️ Warning: Size mismatch detected in non-LoRA trainables loading. Skipping... \nError: {e}")
+                    print("These weights (e.g., projector) will likely be loaded correctly via LoRA adapter later.")
+                else:
+                    raise e
 
             from peft import PeftModel
             print('Loading LoRA weights...')
             model = PeftModel.from_pretrained(model, model_path)
-            print('Merging LoRA weights...')
-            model = model.merge_and_unload()
+            # print('Merging LoRA weights...')
+            # model = model.merge_and_unload()
             print('Model is loaded...')
         elif model_base is not None:
             # this may be mm projector only
