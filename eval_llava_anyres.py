@@ -1,6 +1,7 @@
 import argparse
 import torch
 import os
+from PIL import Image
 import json
 from tqdm import tqdm
 import numpy as np
@@ -13,7 +14,9 @@ from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_S
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
+from llava.mm_utils import tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria, process_images
+from PIL import Image
+from pathlib import Path
 
 # 기존 데이터 로더 (사용자 환경에 맞게 경로 확인 필요)
 import sys
@@ -28,10 +31,14 @@ def parse_args():
     parser.add_argument("--conv_mode", type=str, default="llava_v1")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--image_aspect_ratio", type=str, default="pad")
+    parser.add_argument("--mm_patch_merge_type", type=str, default=None)  # optional override
+    parser.add_argument("--image_grid_pinpoints", type=str, default=None,
+                    help="Only needed if model config lacks image_grid_pinpoints. "
+                         "Pass same value used in training/config.json.")
     parser.add_argument("--output_dir", type=str, default="./eval_results")
     return parser.parse_args()
 
-def get_loss(model, input_ids, attention_mask, images, labels):
+def get_loss(model, input_ids, attention_mask, images, labels, image_sizes=None):
     """
     특정 텍스트 시퀀스(질문+정답)에 대한 모델의 Loss를 계산합니다.
     """
@@ -40,51 +47,10 @@ def get_loss(model, input_ids, attention_mask, images, labels):
             input_ids=input_ids,
             attention_mask=attention_mask,
             images=images,
-            labels=labels
+            labels=labels,
+            image_sizes=image_sizes,  
         )
     return outputs.loss.item()
-
-# def prepare_input(tokenizer, model, image, meta, label, target_type, conv_mode):
-#     """
-#     학습 데이터(JSON)와 동일한 프롬프트 형식을 사용하도록 수정함
-#     target_type: 'normal' 또는 'anomalous'
-#     """
-    
-#     # 1. 학습 때 쓴 질문 (JSON의 "from": "human" 부분과 일치시킴)
-#     # 주의: JSON에는 <image>\n 이 앞에 있지만, LLaVA 템플릿 처리 시 자동 추가되므로 텍스트만 적음
-#     qs = "Inspect this image for manufacturing defects. Is this object normal or anomalous? If anomalous, describe the defects."
-    
-#     # 이미지 토큰 추가 (LLaVA 컨벤션)
-#     if DEFAULT_IMAGE_TOKEN not in qs:
-#         qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
-
-#     # 2. 대화 템플릿 생성
-#     conv = conv_templates[conv_mode].copy()
-#     conv.append_message(conv.roles[0], qs)
-    
-#     # 3. 후보 정답 생성 (JSON의 "from": "gpt" 부분 스타일을 따름)
-#     # 평가 시에는 구체적인 결함 내용(scratches 등)을 모르므로,
-#     # 모델이 "The object is normal." vs "The object is anomalous." 중 무엇을 더 선호하는지 비교합니다.
-#     if target_type == 'normal':
-#         target_response = "The object is normal."
-#     else:
-#         # 학습 데이터가 "The object is anomalous. Detected defects: ..." 형식이지만,
-#         # 앞부분만 비교해도 충분합니다. (Perplexity는 앞부분이 맞으면 낮게 나옴)
-#         target_response = "The object is anomalous."
-
-#     conv.append_message(conv.roles[1], target_response)
-#     prompt = conv.get_prompt()
-
-#     # 4. 토크나이징
-#     input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
-    
-#     # 5. Loss 계산용 타겟 복사
-#     targets = input_ids.clone()
-    
-#     # (옵션) 질문 부분 마스킹은 복잡하므로 일단 전체 문장 Loss 비교로 진행
-#     # 정확도를 높이려면 conv.sep 등을 이용해 질문 부분을 -100으로 채우는 게 좋음
-    
-#     return input_ids, targets
 
 def prepare_input(tokenizer, model, image, meta, label, target_type, conv_mode):
     """
@@ -171,6 +137,18 @@ def main():
     # transformers device_map 확인(있으면)
     print("hf_device_map:", getattr(model, "hf_device_map", None))
 
+    model.config.image_aspect_ratio = args.image_aspect_ratio
+    if args.mm_patch_merge_type is not None:
+        model.config.mm_patch_merge_type = args.mm_patch_merge_type
+
+    if args.image_aspect_ratio == "anyres":
+        # process_images(anyres)가 이 값을 씁니다.
+        if not hasattr(model.config, "image_grid_pinpoints") or model.config.image_grid_pinpoints is None:
+            if args.image_grid_pinpoints is None:
+                raise ValueError("anyres requires model.config.image_grid_pinpoints. "
+                                "Pass --image_grid_pinpoints or ensure it's in config.json.")
+            model.config.image_grid_pinpoints = args.image_grid_pinpoints
+
     
     # 2. 데이터 로더 준비
     test_loader = make_dataloader(
@@ -200,6 +178,16 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("Start Evaluation...")
+    def resolve_image_path(meta, visa_root):
+        # meta에 들어있는 경로 키는 구현마다 달라서 여러 후보를 순서대로 봅니다.
+        for k in ["img_path", "image_path", "path", "file_path", "filepath", "file_name", "filename", "image"]:
+            if k in meta and meta[k]:
+                p = str(meta[k])
+                if os.path.isabs(p):
+                    return p
+                return str(Path(visa_root) / p)
+        raise KeyError(f"Cannot find image path in meta keys={list(meta.keys())}")
+
     for batch in tqdm(test_loader):
         # 배치 사이즈가 1이라고 가정
         # image_tensor = batch["image"].to(model.device, dtype=torch.float16)
@@ -207,24 +195,35 @@ def main():
         # image_tensor_flipped = torch.flip(image_tensor, [3])
         label = int(batch["label"].item())
         meta = batch["meta"] # list of dict, but batch=1 -> dict 접근 필요
-        if isinstance(meta, list): meta = meta[0]
-        # if label == 0 and normal_print_count > 50:
-        #     continue
-        # if label == 1 and anomaly_print_count > 50:
-        #     continue
-        # LLaVA Image Processor 적용 (이미 DataLoader에서 전처리 되었을 수 있음 확인 필요)
-        # make_dataloader가 CLIP transform을 쓴다면 그대로 사용, raw image라면 image_processor.preprocess 필요.
-        # 여기서는 DataLoader가 텐서를 준다고 가정하고 그대로 사용. 
-        # 만약 CLIP ViT 입력을 위해 추가 처리가 필요하다면 image_processor 사용.
+        if isinstance(meta, list): 
+            meta = meta[0]
+
+        if args.image_aspect_ratio == "anyres":
+            # 1) PIL 원본 로드
+            img_path = resolve_image_path(meta, args.visa_root)
+            pil_img = Image.open(img_path).convert("RGB")
+
+            # 2) anyres 패치 전처리 + 원본 사이즈 기록 (w,h)
+            image_sizes = [pil_img.size]  # [(width, height)]
+            images = process_images([pil_img], image_processor, model.config)
+
+            # 3) vision_tower 디바이스/타입으로 이동
+            if isinstance(images, torch.Tensor):
+                image_tensor = images.to(vt.device, dtype=vt.dtype)
+            else:
+                # (패치 개수가 이미지마다 다르면 list로 올 수 있음)
+                image_tensor = [x.to(vt.device, dtype=vt.dtype) for x in images]
+        else:
+            image_sizes = None
+            image_tensor = batch["image"].to(vt.device, dtype=vt.dtype)
         
         # 4. Normal 가설 검증
         input_ids_n, targets_n = prepare_input(tokenizer, model, image_tensor, meta, label, 'normal', args.conv_mode)
-        loss_normal = get_loss(model, input_ids_n, None, image_tensor, targets_n)
+        loss_normal = get_loss(model, input_ids_n, None, image_tensor, targets_n, image_sizes=image_sizes)
 
         # 5. Anomaly 가설 검증 ("The object is anomalous.")
         input_ids_a, targets_a = prepare_input(tokenizer, model, image_tensor, meta, label, 'anomalous', args.conv_mode)
-        loss_anom = get_loss(model, input_ids_a, None, image_tensor, targets_a)
-
+        loss_anom = get_loss(model, input_ids_a, None, image_tensor, targets_a, image_sizes=image_sizes)
         # # ---------------------------------------------------------
         # # [2] 뒤집은 이미지 평가 (검증용)
         # # ---------------------------------------------------------

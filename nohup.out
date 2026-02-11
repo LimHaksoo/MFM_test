@@ -1744,3 +1744,4 @@ Accuracy: 0.8891
 Precision: 0.0000
 Recall: 0.0000
 F1 Score: 0.0000
+sh: 0: cannot open ./scripts/long_term_forecast/_Solar/DLinear_gaussian.sh: No such file

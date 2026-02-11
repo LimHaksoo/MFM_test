@@ -578,8 +578,9 @@ def _download_goodsad_via_kaggle(dest_root: str):
 def ensure_dataset_ready(dataset_name: str, dest_root: str) -> str:
    
     ds = dataset_name.lower()
-    # if _has_enough_images(dest_root):
-    #     return dest_root
+    if _has_enough_images(dest_root, min_count=10):
+        print(f"[auto] '{ds}' already ready at: {dest_root} (skip download)")
+        return dest_root
 
     print(f"[auto] '{ds}' not found at {dest_root}. Start downloading...")
     if ds == "visa":

@@ -31,17 +31,17 @@ def safe_load_state_dict(self, state_dict, strict=True):
     # 일단 원래대로 시도해봅니다.
     if strict:
         try:
-            return original_load_state_dict(self, state_dict, strict=True)
+            return original_load_state_dict(self, state_dict, strict=True, assign=True)
         except RuntimeError as e:
             # 만약 "키가 없다(Missing key)"는 에러가 나면?
             if "Missing key(s) in state_dict" in str(e):
                 print(f"\n[LoRA Fix] ⚠️ '{self.__class__.__name__}' 로딩 중 누락된 키 발생! (Frozen Base Model 무시함)")
                 print("[LoRA Fix] strict=False 모드로 재시도합니다...\n")
                 # 엄격 모드를 끄고(strict=False) 다시 로딩합니다. (이게 핵심!)
-                return original_load_state_dict(self, state_dict, strict=False)
+                return original_load_state_dict(self, state_dict, strict=False, assign=True)
             # 다른 에러라면 그냥 터지게 둡니다.
             raise e
-    return original_load_state_dict(self, state_dict, strict=strict)
+    return original_load_state_dict(self, state_dict, strict=strict, assign=True)
 
 # 파이썬이 모델을 로딩할 때, 우리가 만든 '유연한 함수'를 쓰도록 바꿔치기합니다.
 torch.nn.Module.load_state_dict = safe_load_state_dict
@@ -55,7 +55,7 @@ from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
-from llava.mm_utils import tokenizer_image_token
+from llava.mm_utils import tokenizer_image_token, process_images
 
 from PIL import Image
 
@@ -96,6 +96,7 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    image_grid_pinpoints: str = '[[336,336],[336,672],[672,336],[672,672]]'
 
 
 @dataclass
@@ -721,23 +722,36 @@ class LazySupervisedDataset(Dataset):
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
-            if self.data_args.image_aspect_ratio == 'pad':
-                def expand2square(pil_img, background_color):
-                    width, height = pil_img.size
-                    if width == height:
-                        return pil_img
-                    elif width > height:
-                        result = Image.new(pil_img.mode, (width, width), background_color)
-                        result.paste(pil_img, (0, (width - height) // 2))
-                        return result
-                    else:
-                        result = Image.new(pil_img.mode, (height, height), background_color)
-                        result.paste(pil_img, ((height - width) // 2, 0))
-                        return result
-                image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-            else:
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            # if self.data_args.image_aspect_ratio == 'pad':
+            #     def expand2square(pil_img, background_color):
+            #         width, height = pil_img.size
+            #         if width == height:
+            #             return pil_img
+            #         elif width > height:
+            #             result = Image.new(pil_img.mode, (width, width), background_color)
+            #             result.paste(pil_img, (0, (width - height) // 2))
+            #             return result
+            #         else:
+            #             result = Image.new(pil_img.mode, (height, height), background_color)
+            #             result.paste(pil_img, ((height - width) // 2, 0))
+            #             return result
+            #     image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+            #     image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            # else:
+            #     image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            image_size = image.size  # (W, H)  ✅ anyres spatial_unpad에 필요
+        
+            model_cfg = getattr(self.data_args, "model_cfg", None)
+            if model_cfg is None:
+                # fallback: 최소한 image_aspect_ratio라도 담긴 cfg를 만들어서 사용
+                class _TmpCfg: pass
+                model_cfg = _TmpCfg()
+                model_cfg.image_aspect_ratio = self.data_args.image_aspect_ratio
+        
+            # ✅ 핵심: anyres면 여기서 (base + patches) 텐서가 생성됨
+            # process_images([PIL]) -> shape (1, ...) 이므로 [0]으로 per-sample 텐서로 바꿈
+            image = process_images([image], processor, model_cfg)[0]
+
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
@@ -754,10 +768,15 @@ class LazySupervisedDataset(Dataset):
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
+            if self.data_args.image_aspect_ratio == "anyres":
+                data_dict["image_sizes"] = image_size
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            if self.data_args.image_aspect_ratio == "anyres":
+                data_dict["image_sizes"] = (0, 0)  # dummy (패치가 없으면 보통 안 씀)
+
         return data_dict
 
 
@@ -791,7 +810,11 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
-
+        if any('image_sizes' in inst for inst in instances):
+            batch['image_sizes'] = [inst.get('image_sizes', (0, 0)) for inst in instances]
+        # valid = (batch["labels"] != -100).sum().item()
+        # print("valid_label_tokens:", valid)
+        
         return batch
 
 
@@ -818,10 +841,20 @@ def train(attn_implementation=None):
     compute_dtype = torch.float16
 
     bnb_model_from_pretrained_args = {}
+    
+    max_memory = {
+    "cuda:0": "7.5GiB", "cuda:1": "7.5GiB", "cuda:2": "7.5GiB",
+    "cuda:3": "7.5GiB", "cuda:4": "7.5GiB", "cuda:5": "7.5GiB",
+    "cpu": "64GiB"
+    }
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
         bnb_model_from_pretrained_args.update(dict(
-            device_map={"": training_args.device},
+            # device_map={"": training_args.device},
+            device_map="auto",
+            max_memory=max_memory,
+            offload_folder="offload",          # CPU offload 폴더 (선택이지만 추천)
+            offload_state_dict=True,           # 로딩 시 CPU offload 도움
             load_in_4bit=training_args.bits == 4,
             load_in_8bit=training_args.bits == 8,
             quantization_config=BitsAndBytesConfig(
@@ -863,7 +896,16 @@ def train(attn_implementation=None):
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
+    metas = report_meta_all(model)
+    assert len(metas) == 0, "Some params stayed on META. Check missing keys or broken checkpoint."
+    print("model class:", model.__class__.__name__)
+    print("model name_or_path:", getattr(model.config, "_name_or_path", None))
 
+    trainable = [(n, p.numel()) for n,p in model.named_parameters() if p.requires_grad]
+    print("trainable param groups:", len(trainable))
+    print("top trainables:", trainable[:20])
+    print("total trainable params:", sum(x[1] for x in trainable))
+    
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -943,6 +985,24 @@ def train(attn_implementation=None):
         data_args.is_multimodal = True
 
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
+        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
+
+        rank0_print("image_aspect_ratio:", getattr(model.config, "image_aspect_ratio", None))
+        rank0_print("mm_patch_merge_type:", getattr(model.config, "mm_patch_merge_type", None))
+        rank0_print("image_grid_pinpoints:", getattr(model.config, "image_grid_pinpoints", None))
+
+        # ✅ (중요) CLI로 받은 mm_patch_merge_type을 config에 반영
+        model.config.mm_patch_merge_type = model_args.mm_patch_merge_type
+        # ✅ dataset에서 process_images가 model_cfg를 참조할 수 있게 전달
+        data_args.model_cfg = model.config
+    
+        # ✅ anyres면 grid pinpoints가 config에 있어야 함(없으면 여기서 바로 에러로 잡는게 좋음)
+        if data_args.image_aspect_ratio == "anyres" and not hasattr(model.config, "image_grid_pinpoints"):
+            raise ValueError(
+                "image_aspect_ratio=anyres 인데 model.config.image_grid_pinpoints 가 없습니다. "
+                "베이스/체크포인트 config.json에 있어야 anyres 패치 분할이 동작합니다."
+            )
+    
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
@@ -1008,6 +1068,21 @@ def train(attn_implementation=None):
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
+
+def report_meta_all(model, topk=50):
+    metas = []
+    for n, p in model.named_parameters():
+        if getattr(p, "is_meta", False) or (hasattr(p, "device") and p.device.type == "meta"):
+            metas.append(("param", n, p.shape, p.dtype, str(p.device)))
+
+    for n, b in model.named_buffers():
+        if getattr(b, "is_meta", False) or (hasattr(b, "device") and b.device.type == "meta"):
+            metas.append(("buffer", n, b.shape, b.dtype, str(b.device)))
+
+    print(f"[META ALL] {len(metas)} tensors are on meta (params+buffers)")
+    for kind, n, s, d, dev in metas[:topk]:
+        print(f" - {kind:6s} {n} {s} {d} {dev}")
+    return metas
 
 
 if __name__ == "__main__":

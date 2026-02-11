@@ -1,0 +1,5 @@
+Accuracy: 0.1130
+Precision: 0.1111
+Recall: 1.0000
+F1 Score: 0.2000
+TP: 480, FP: 3839, TN: 9, FN: 0

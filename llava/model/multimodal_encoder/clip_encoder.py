@@ -21,13 +21,18 @@ class CLIPVisionTower(nn.Module):
         else:
             self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
 
-    def load_model(self, device_map=None):
+    def load_model(self, device_map=None, device=None, dtype=torch.float16):
         if self.is_loaded:
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name,
+             torch_dtype=dtype,
+             low_cpu_mem_usage=False,
+             device_map=None,)
+        if device is not None:
+            self.vision_tower.to(device=device, dtype=dtype)
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True
@@ -110,13 +115,19 @@ class CLIPVisionTowerS2(CLIPVisionTower):
             self.image_processor.size['shortest_edge'] = self.s2_image_size
             self.image_processor.crop_size['height'] = self.image_processor.crop_size['width'] = self.s2_image_size
 
-    def load_model(self, device_map=None):
+    def load_model(self, device_map=None, device=None, dtype=torch.float16):
         if self.is_loaded:
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name,
+             torch_dtype=dtype,
+             low_cpu_mem_usage=False,
+             device_map=None
+         )
+        if device is not None:
+            self.vision_tower.to(device=device, dtype=dtype)
         self.vision_tower.requires_grad_(False)
 
         self.image_processor.size['shortest_edge'] = self.s2_image_size
